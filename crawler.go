@@ -28,11 +28,11 @@ func (n Notice) toJSON() string {
 }*/
 
 type Notice struct {
-	date    string `json:"date"`
-	title   string `json:"title"`
-	url     string `json:"url"`
-	image   string `json:"image"`
-	content string `json:"content"`
+	Date    string `json:"date"`
+	Title   string `json:"title"`
+	Url     string `json:"url"`
+	Image   string `json:"image"`
+	Content string `json:"content"`
 }
 
 // Static and dynamic Variables
@@ -78,11 +78,11 @@ func main() {
 	c.OnHTML("div.blog-post-container", func(e *colly.HTMLElement) {
 
 		notice := Notice{
-			date:    e.ChildText("div.blog-post-inner > div.small-text"),
-			title:   e.ChildText("h3.blog-post-title"),
-			url:     e.ChildAttr("a", "href"),
-			image:   e.ChildAttr("div.blog-post-image > img", "src"),
-			content: getArticleContent(e.ChildAttr("a", "href")),
+			Date:    e.ChildText("div.blog-post-inner > div.small-text"),
+			Title:   e.ChildText("h3.blog-post-title"),
+			Url:     e.ChildAttr("a", "href"),
+			Image:   e.ChildAttr("div.blog-post-image > img", "src"),
+			Content: getArticleContent(e.ChildAttr("a", "href")),
 			//Title:       title,
 			//URL:         e.Request.URL.String(),
 			//Description: e.ChildText("div.content"),
