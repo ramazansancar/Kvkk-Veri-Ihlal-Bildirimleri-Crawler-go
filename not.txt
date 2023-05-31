@@ -1,0 +1,5 @@
+
+Proje oluşturmak için: go mod init [proje_adı]/[main_dosya]
+Çalıştırmak için: go run .
+Mod dosyasında hata varsa: go mod tidy
+Paket yüklemek için: go get github.com/gocolly/colly/v2
