@@ -2,20 +2,21 @@
 
 ## Installation
 
-```
+```bash
 go mod tidy
-go build -o kvkk crawler.go
+go build -o crawler crawler.go
 ```
 
 ## Usage
 
-```
+```bash
 go run .
 ```
 
-# License
+## License
+
 [MIT](LISENCE)
 
-# Author
+## Author
 
 [Ramazan Sancar](https://www.github.com/ramazansancar)
