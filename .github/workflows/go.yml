@@ -18,17 +18,17 @@ jobs:
       uses: actions/setup-go@v5
       with:
         go-version: 1.21
-        check-latest: true
-        cache: true
+        check-latest: false
+        cache: false
 
     - name: Install dependencies and build
-      run: |
-        go mod download -x
-        go build -o crawler crawler.go
+      run: go mod download -x
+
+    - name: Build
+      run: go build -o crawler crawler.go
 
     - name: Run
-      run: |
-        go run .
+      run: go run .
 
     - name: Deploy
       uses: stefanzweifel/git-auto-commit-action@v5
