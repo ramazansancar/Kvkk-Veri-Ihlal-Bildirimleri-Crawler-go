@@ -33,7 +33,14 @@ func getArticleContent(url string) string {
 		Content string `json:"content"`
 	}
 	article := Article{}
-	c := colly.NewCollector()
+	c := colly.NewCollector(
+		// Visit only domains: hackerspaces.org, wiki.hackerspaces.org
+		colly.AllowedDomains("kvkk.gov.tr"),
+
+		// Cache responses to prevent multiple download of pages
+		// even if the collector is restarted
+		colly.CacheDir("./kvkk_cache"),
+	)
 
 	c.OnRequest(func(r *colly.Request) {
 		fmt.Println("Visiting Detail: ", r.URL.String())
@@ -156,7 +163,7 @@ func main() {
 			Date:    e.ChildText("p.blog-grid-meta > span > a"),
 			Title:   e.ChildAttr("h4.blog-grid-title > a", "title"),
 			Url:     baseUrl + e.ChildAttr("div.blog-grid-thumb > a", "href"),
-			Image:   baseUrl + e.ChildAttr("div.blog-grid-thumb > a > img", "src"),
+			Image:   strings.Replace(baseUrl+e.ChildAttr("div.blog-grid-thumb > a > img", "src"), "/Image/CropImage?w=420&h=205&f=", "", 1),
 			Content: getArticleContent(baseUrl + e.ChildAttr("div.blog-grid-thumb > a", "href")),
 		}
 		notices = append(notices, notice)
