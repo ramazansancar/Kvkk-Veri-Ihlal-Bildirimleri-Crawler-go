@@ -46,9 +46,34 @@ func getArticleContent(url string) string {
 		fmt.Println("Visiting Detail: ", r.URL.String())
 	})
 
-	c.OnHTML("div.blog-post-inner", func(e *colly.HTMLElement) {
+	c.OnHTML("div.blog-post-container > div.blog-post-inner", func(e *colly.HTMLElement) {
 		article.Title = e.ChildText("h3.blog-post-title")
 		article.Content = e.ChildText("div.blog-post-inner > div")
+
+		// Bazı sayfalarda içerik div içinde değil, p içinde olabiliyor Ancak burada da çok fazla p var
+		// Bu yüzden önce div içindeki içeriği alıp, boşsa p içindeki içeriği alıyoruz
+		if article.Content == "" {
+			contents := []string{}
+			e.ForEach("div.blog-post-inner > *", func(_ int, el *colly.HTMLElement) {
+				// İlgili tag'e göre işlem yapılabilir, örneğin <li> için madde işareti eklemek gibi.
+				switch el.Name {
+				case "h3":
+					if article.Title == "" {
+						article.Title = el.Text
+					}
+				case "p":
+					contents = append(contents, el.Text+"\n\n")
+				case "ul":
+					el.ForEach("li", func(_ int, li *colly.HTMLElement) {
+						contents = append(contents, "\n\t"+li.Text)
+					})
+				}
+			})
+			//article.Content = strings.Join(contents, "\n\n")
+			article.Content = strings.Join(contents, "")
+			// En sonda \n\n ekleniyor. Onu kaldırmak için
+			article.Content = article.Content[:len(article.Content)-2]
+		}
 	})
 
 	c.Visit(url)
@@ -78,7 +103,7 @@ func main() {
 	// Create another collector to scrape additional details
 	// detailCollector := c.Clone()
 
-	notices := make([]Notice, 0, 200)
+	notices := make([]Notice, 0, 1000)
 
 	/*
 		<div class="row mt-5 pagination">
