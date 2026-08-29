@@ -4,9 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gocolly/colly/v2"
 )
@@ -19,233 +24,220 @@ type Notice struct {
 	Content string `json:"content"`
 }
 
-// Static and dynamic Variables
 var (
-	baseUrl = "https://kvkk.gov.tr"
-	apiUrl  = baseUrl + "/veri-ihlali-bildirimi/?page="
-	maxPage = 1
+	baseUrl = "https://www.kvkk.gov.tr"
+	// NOTE: no trailing slash before "?" - "/veri-ihlali-bildirimi/?page=N" returns a
+	// 301 to the slashless form. colly does not follow that redirect for the listing
+	// pages, so the crawler silently scraped nothing (cause of the 7-month data gap).
+	apiUrl = baseUrl + "/veri-ihlali-bildirimi?page="
 )
 
-// Get article content
-func getArticleContent(url string) string {
-	type Article struct {
-		Title   string `json:"title"`
-		Content string `json:"content"`
-	}
-	article := Article{}
+// Global map to track processed URLs throughout the session
+var processedInSession = make(map[string]bool)
+
+func getArticleContent(noticeUrl string) string {
+	var content strings.Builder
 	c := colly.NewCollector(
-		// Visit only domains: hackerspaces.org, wiki.hackerspaces.org
-		colly.AllowedDomains("kvkk.gov.tr"),
-
-		// Cache responses to prevent multiple download of pages
-		// even if the collector is restarted
-		colly.CacheDir("./kvkk_cache"),
+		colly.AllowedDomains("kvkk.gov.tr", "www.kvkk.gov.tr"),
 	)
+	c.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-	c.OnRequest(func(r *colly.Request) {
-		fmt.Println("Visiting Detail: ", r.URL.String())
-	})
-
-	c.OnHTML("div.blog-post-container > div.blog-post-inner", func(e *colly.HTMLElement) {
-		article.Title = e.ChildText("h3.blog-post-title")
-		article.Content = e.ChildText("div.blog-post-inner > div")
-
-		// Bazı sayfalarda içerik div içinde değil, p içinde olabiliyor Ancak burada da çok fazla p var
-		// Bu yüzden önce div içindeki içeriği alıp, boşsa p içindeki içeriği alıyoruz
-		if article.Content == "" {
-			contents := []string{}
-			e.ForEach("div.blog-post-inner > *", func(_ int, el *colly.HTMLElement) {
-				// İlgili tag'e göre işlem yapılabilir, örneğin <li> için madde işareti eklemek gibi.
-				switch el.Name {
-				case "h3":
-					if article.Title == "" {
-						article.Title = el.Text
-					}
-				case "p":
-					contents = append(contents, el.Text+"\n\n")
-				case "ul":
-					el.ForEach("li", func(_ int, li *colly.HTMLElement) {
-						contents = append(contents, "\n\t"+li.Text)
-					})
+	c.OnResponse(func(r *colly.Response) {
+		if strings.Contains(string(r.Body), "resend()") {
+			re := regexp.MustCompile(`sto-idd=([^;"]+)`)
+			match := re.FindStringSubmatch(string(r.Body))
+			if len(match) > 1 {
+				cookie := &http.Cookie{
+					Name:   "sto-idd",
+					Value:  match[1],
+					Domain: "www.kvkk.gov.tr",
+					Path:   "/",
 				}
-			})
-			//article.Content = strings.Join(contents, "\n\n")
-			article.Content = strings.Join(contents, "")
-			// En sonda \n\n ekleniyor. Onu kaldırmak için
-			article.Content = article.Content[:len(article.Content)-2]
+				c.SetCookies(r.Request.URL.String(), []*http.Cookie{cookie})
+				r.Request.Retry()
+			}
 		}
 	})
 
-	c.Visit(url)
-
-	return article.Content
-}
-
-func main() {
-	fName := "data.json"
-	file, err := os.Create(fName)
-	if err != nil {
-		log.Fatalf("Cannot create file %q: %s\n", fName, err)
-		return
-	}
-	defer file.Close()
-
-	// Instantiate default collector
-	c := colly.NewCollector(
-		// Visit only domains: hackerspaces.org, wiki.hackerspaces.org
-		colly.AllowedDomains("kvkk.gov.tr"),
-
-		// Cache responses to prevent multiple download of pages
-		// even if the collector is restarted
-		colly.CacheDir("./kvkk_cache"),
-	)
-
-	// Create another collector to scrape additional details
-	// detailCollector := c.Clone()
-
-	notices := make([]Notice, 0, 1000)
-
-	/*
-		<div class="row mt-5 pagination">
-			<div class="col-md-12">
-				<nav>
-					<ul class="pagination justify-content-center">
-						<li class="page-item active"><a class="page-link">1</a></li>
-						<li class="page-item"><a class="page-link" href="/veri-ihlali-bildirimi/?&amp;page=2">2</a></li>
-						...
-						<li class="page-item"><a class="page-link" href="/veri-ihlali-bildirimi/?&amp;page=10">10</a></li>
-						<li class="page-item"><a class="page-link" href="/veri-ihlali-bildirimi/?&amp;page=2">Sonraki</a></li>
-						<li class="page-item"><a class="page-link" href="/veri-ihlali-bildirimi/?&amp;page=26">Son</a></li>
-					</ul>
-				</nav>
-			</div>
-		</div>
-	*/
-	// Max Page fetcher
-	c.OnHTML("ul.pagination", func(e *colly.HTMLElement) {
-		e.ForEach("li", func(_ int, el *colly.HTMLElement) {
-			// Fetch "Son" a href value split "page=" and get the number
-			if el.ChildText("a") == "Son" {
-				maxPage, _ = strconv.Atoi(el.ChildAttr("a", "href")[strings.Index(el.ChildAttr("a", "href"), "page=")+5:])
+	c.OnHTML("div.news__detail-article", func(e *colly.HTMLElement) {
+		e.ForEach("p, ul", func(_ int, el *colly.HTMLElement) {
+			if el.Name == "p" {
+				text := strings.TrimSpace(el.Text)
+				if text != "" {
+					content.WriteString(text + "\n\n")
+				}
+			} else if el.Name == "ul" {
+				el.ForEach("li", func(_ int, li *colly.HTMLElement) {
+					content.WriteString("- " + strings.TrimSpace(li.Text) + "\n")
+				})
+				content.WriteString("\n")
 			}
 		})
 	})
 
-	/*
-		<div class="blog-post-container">
-			<div class="blog-post-image">
-				<img src="/SharedFolderServer/ContentImages/d74ed9d6-67d1-45a1-8c3e-349834c0bb73.jpg" alt="">
-				<div class="blog-post-meta"></div>
-			</div>
-			<div class="blog-post-inner">
-				<p class="small-text">17 Ekim 2024</p>
-				<h3 class="blog-post-title">Kamuoyu Duyurusu (Veri İhlali Bildirimi) – Lokman Hekim &#220;niversitesi</h3>
-				<p></p>
+	c.Visit(noticeUrl)
+	return strings.TrimSpace(content.String())
+}
 
-				<div class="row justify-content-end">
-					<a target="_self" href="/Icerik/8041/Kamuoyu-Duyurusu-Veri-Ihlali-Bildirimi-Lokman-Hekim-Universitesi" class="arrow-link all-items"> Devamını G&#246;r </a>
-				</div>
-			</div>
-		</div>
-	*/
-	// Blog post page scraper
-	c.OnHTML("div.blog-post-container", func(e *colly.HTMLElement) {
-		notice := Notice{
-			Date:    e.ChildText("div.blog-post-inner > p.small-text"),
-			Title:   e.ChildText("h3.blog-post-title"),
-			Url:     baseUrl + e.ChildAttr("a", "href"),
-			Image:   baseUrl + e.ChildAttr("div.blog-post-image > img", "src"),
-			Content: getArticleContent(baseUrl + e.ChildAttr("a", "href")),
-			//Title:       title,
-			//URL:         e.Request.URL.String(),
-			//Description: e.ChildText("div.content"),
-			//Creator:     e.ChildText("li.banner-instructor-info > a > div > div > span"),
-			//Rating:      e.ChildText("span.number-rating"),
+func main() {
+	fName := "data.json"
+	existingNotices := []Notice{}
+	absPath, _ := filepath.Abs(fName)
+	if _, err := os.Stat(absPath); err == nil {
+		fileData, err := os.ReadFile(absPath)
+		if err != nil {
+			log.Fatalf("Cannot read existing file %q: %s\n", fName, err)
+		}
+		// Fail fast instead of silently treating a corrupt/unreadable file as "no data",
+		// which would cause the merge below to overwrite existing records with an empty list.
+		if len(strings.TrimSpace(string(fileData))) > 0 {
+			if err := json.Unmarshal(fileData, &existingNotices); err != nil {
+				log.Fatalf("Cannot parse existing file %q: %s\n", fName, err)
+			}
+		}
+	}
+
+	normalizeURL := func(u string) string {
+		parsed, _ := url.Parse(u)
+		host := strings.TrimPrefix(parsed.Host, "www.")
+		path := strings.TrimSuffix(parsed.Path, "/")
+		// Handle Turkish characters in URL if any
+		return host + path
+	}
+
+	noticeMap := make(map[string]bool)
+	for _, n := range existingNotices {
+		noticeMap[normalizeURL(n.Url)] = true
+	}
+
+	c := colly.NewCollector(
+		colly.AllowedDomains("kvkk.gov.tr", "www.kvkk.gov.tr"),
+	)
+	c.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+	c.OnResponse(func(r *colly.Response) {
+		fmt.Println("DEBUG status:", r.StatusCode, "len:", len(r.Body), "url:", r.Request.URL.String())
+		if strings.Contains(string(r.Body), "resend()") {
+			fmt.Println("Security challenge detected. Retrying with session cookie...")
+			re := regexp.MustCompile(`sto-idd=([^;"]+)`)
+			match := re.FindStringSubmatch(string(r.Body))
+			if len(match) > 1 {
+				cookie := &http.Cookie{
+					Name:   "sto-idd",
+					Value:  match[1],
+					Domain: "www.kvkk.gov.tr",
+					Path:   "/",
+				}
+				c.SetCookies(r.Request.URL.String(), []*http.Cookie{cookie})
+				r.Request.Retry()
+			}
+		}
+	})
+
+	newNotices := []Notice{}
+	// Counts every notice link seen on the listing pages (new or already known).
+	// Zero means the scrape itself failed (bad URL, markup change, block page) rather
+	// than "the site published nothing new" - those must not be confused.
+	seenOnSite := 0
+	maxPage := 1
+
+	c.OnHTML("ul.pagination", func(e *colly.HTMLElement) {
+		// Rely on the numeric "page=" value rather than link text (site copy like
+		// "Son"/"Son Sayfa"/"»" changes over time), so pick the highest page number found.
+		e.ForEach("li a[href]", func(_ int, el *colly.HTMLElement) {
+			href := el.Attr("href")
+			if strings.Contains(href, "page=") {
+				parts := strings.Split(href, "page=")
+				val := parts[len(parts)-1]
+				if idx := strings.IndexAny(val, "&#"); idx != -1 {
+					val = val[:idx]
+				}
+				if p, err := strconv.Atoi(val); err == nil && p > maxPage {
+					maxPage = p
+				}
+			}
+		})
+	})
+
+	c.OnHTML("div.news__box", func(e *colly.HTMLElement) {
+		u := e.ChildAttr("div.news__box-meta > a", "href")
+		if u == "" {
+			return
 		}
 
-		// fmt.Printf("Found: %q -> %s \nImage: %s\nContent: %s", notice.title, notice.url, notice.image, notice.content)
-
-		notices = append(notices, notice)
-		//fmt.Println(notices)
-	})
-
-	/*
-		<div class="blog-grid-item h-100 d-block">
-			<div class="blog-grid-thumb">
-				<a target="_self" href="/Icerik/8035/Kamuoyu-Duyurusu-Veri-Ihlali-Bildirimi-Kilis-7-Aralik-Universitesi">
-					<img src="/Image/CropImage?w=420&amp;h=205&amp;f=/SharedFolderServer/ContentImages/b7f03eba-7adc-44a7-aea7-fda7b400b841.jpg" alt="">
-				</a>
-			</div>
-			<div class="box-content-inner">
-				<h4 class="blog-grid-title"><a target="_self" data-placement="bottom" data-toggle="tooltip" title="Kamuoyu Duyurusu (Veri İhlali Bildirimi) – Kilis 7 Aralık &#220;niversitesi" href="/Icerik/8035/Kamuoyu-Duyurusu-Veri-Ihlali-Bildirimi-Kilis-7-Aralik-Universitesi">Kamuoyu Duyurusu (Veri İhlali Bildirimi) – Kilis 7 Aralık &#220;niversitesi...</a></h4>
-				<p class="blog-grid-meta small-text"><span><a target="_self" href="/Icerik/8035/Kamuoyu-Duyurusu-Veri-Ihlali-Bildirimi-Kilis-7-Aralik-Universitesi">09 Ekim 2024</a></span> </p>
-			</div>
-		</div>
-	*/
-	// Blog grid page scraper
-	c.OnHTML("div.blog-grid-item", func(e *colly.HTMLElement) {
-		notice := Notice{
-			Date:    e.ChildText("p.blog-grid-meta > span > a"),
-			Title:   e.ChildAttr("h4.blog-grid-title > a", "title"),
-			Url:     baseUrl + e.ChildAttr("div.blog-grid-thumb > a", "href"),
-			Image:   strings.Replace(baseUrl+e.ChildAttr("div.blog-grid-thumb > a > img", "src"), "/Image/CropImage?w=420&h=205&f=", "", 1),
-			Content: getArticleContent(baseUrl + e.ChildAttr("div.blog-grid-thumb > a", "href")),
+		if !strings.HasPrefix(u, "http") {
+			if strings.HasPrefix(u, "/") {
+				u = baseUrl + u
+			} else {
+				u = baseUrl + "/" + u
+			}
 		}
-		notices = append(notices, notice)
+
+		seenOnSite++
+
+		normUrl := normalizeURL(u)
+		if _, exists := noticeMap[normUrl]; !exists {
+			if _, processed := processedInSession[normUrl]; !processed {
+				fmt.Printf("New notice found: [%s] %s\n", e.ChildText("p.date"), u)
+
+				imgUrl := e.ChildAttr("img", "src")
+				if imgUrl != "" && !strings.HasPrefix(imgUrl, "http") {
+					imgUrl = baseUrl + imgUrl
+				}
+
+				notice := Notice{
+					Date:    strings.TrimSpace(e.ChildText("div.news__box-meta > p.date")),
+					Title:   strings.TrimSpace(e.ChildText("div.news__box-meta > a")),
+					Url:     u,
+					Image:   imgUrl,
+					Content: getArticleContent(u),
+				}
+				newNotices = append(newNotices, notice)
+				processedInSession[normUrl] = true
+			}
+		}
 	})
 
-	// Before making a request print "Visiting ..."
-	c.OnRequest(func(r *colly.Request) {
-		fmt.Println("Visiting: ", r.URL.String())
-	})
+	fmt.Println("Starting crawler...")
+	// Start with Page 1
+	c.Visit(apiUrl + "1")
 
-	for i := 1; i <= maxPage; i++ {
-		// Url: https://kvkk.gov.tr/veri-ihlali-bildirimi/?page=1
+	// If maxPage was updated, visit other pages
+	for i := 2; i <= maxPage; i++ {
+		fmt.Printf("Visiting Page %d...\n", i)
+		time.Sleep(2 * time.Second)
 		c.Visit(apiUrl + strconv.Itoa(i))
 	}
 
-	enc := json.NewEncoder(file)
-	enc.SetIndent("", "  ")
-
-	// Dump json to the standard output
-	enc.Encode(notices)
-
-}
-
-/*func main() {
-    fmt.Println("Hello, World!")
-}*/
-
-/*func (n Notice) String() string {
-	return fmt.Sprintf("%s %s %s %s %s", n.date, n.title, n.url, n.image, n.content)
-}
-
-func (n Notice) toJSON() string {
-	b, err := json.Marshal(n)
-	if err != nil {
-		fmt.Println(err)
-		return ""
+	// A run that saw no notice links at all did not "find nothing new" - it failed to
+	// scrape. Exiting 0 here is what let the workflow stay green for 7 months while
+	// data.json went stale, so make it a hard error.
+	if seenOnSite == 0 {
+		log.Fatalln("Scrape failed: no notices found on any listing page. " +
+			"The listing URL or page markup likely changed - refusing to report success.")
 	}
-	return string(b)
-}*/
 
-/*if e.Attr("class") == "Button_1qxkboh-o_O-primary_cv02ee-o_O-md_28awn8-o_O-primaryLink_109aggg" {
-	return
-}
-link := e.Attr("href")
-// If link start with browse or includes either signup or login return from callback
-if !strings.HasPrefix(link, "/browse") || strings.Index(link, "=signup") > -1 || strings.Index(link, "=login") > -1 {
-	return
-}
-// start scaping the page under the link found
-e.Request.Visit(link)*/
+	fmt.Printf("Scraped %d notices from %d page(s).\n", seenOnSite, maxPage)
 
-// On every a element which has href attribute call callback
-/*c.OnHTML("a[href]", func(e *colly.HTMLElement) {
-link := e.Attr("href")
-// Print link
-fmt.Printf("Link found: %q -> %s\n", e.Text, link)
-// Visit link found on page
-// Only those links are visited which are in AllowedDomains
-c.Visit(e.Request.AbsoluteURL(link))
-})*/
+	if len(newNotices) > 0 {
+		finalNotices := append(newNotices, existingNotices...)
+		// Safety net: never let a run shrink the dataset (e.g. due to a scraping
+		// regression), which is what caused the historical data loss incident.
+		if len(finalNotices) < len(existingNotices) {
+			log.Fatalf("Refusing to write: final record count (%d) is lower than existing (%d)\n", len(finalNotices), len(existingNotices))
+		}
+		file, err := os.Create(fName)
+		if err != nil {
+			log.Fatalf("Cannot create file %q: %s\n", fName, err)
+			return
+		}
+		defer file.Close()
+
+		enc := json.NewEncoder(file)
+		enc.SetIndent("", "  ")
+		enc.Encode(finalNotices)
+		fmt.Printf("Crawler finished. New notices added: %d. Total records: %d\n", len(newNotices), len(finalNotices))
+	} else {
+		fmt.Println("No new notices found to add.")
+	}
+}
