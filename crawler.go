@@ -79,6 +79,17 @@ func getArticleContent(noticeUrl string) string {
 	return strings.TrimSpace(content.String())
 }
 
+// normalizeDate strips the weekday suffix the listing started appending
+// ("26 Agustos 2026, Carsamba" -> "26 Agustos 2026") so new records keep the
+// same "<gun> <ay> <yil>" shape as every record already in data.json.
+func normalizeDate(raw string) string {
+	d := strings.TrimSpace(raw)
+	if idx := strings.Index(d, ","); idx != -1 {
+		d = d[:idx]
+	}
+	return strings.TrimSpace(d)
+}
+
 func main() {
 	fName := "data.json"
 	existingNotices := []Notice{}
@@ -186,7 +197,7 @@ func main() {
 				}
 
 				notice := Notice{
-					Date:    strings.TrimSpace(e.ChildText("div.news__box-meta > p.date")),
+					Date:    normalizeDate(e.ChildText("div.news__box-meta > p.date")),
 					Title:   strings.TrimSpace(e.ChildText("div.news__box-meta > a")),
 					Url:     u,
 					Image:   imgUrl,
