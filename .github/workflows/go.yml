@@ -2,7 +2,10 @@ name: Scheduled Trigger Go CI
 
 on:
   schedule:
-    - cron: '0 0 * * *' # every day at midnight for UTC
+    # 09:00 UTC (12:00 TRT). The old 00:00 UTC slot fired while the KVKK site was
+    # regularly unreachable from GitHub's Azure runners (04:0x UTC job starts), which
+    # is what produced the intermittent red builds.
+    - cron: '0 9 * * *'
 
   # This command allows us to run the Action automatically from the Actions tab.
   workflow_dispatch:
