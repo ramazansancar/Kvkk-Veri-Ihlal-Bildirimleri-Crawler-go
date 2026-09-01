@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -90,8 +91,37 @@ func normalizeDate(raw string) string {
 	return strings.TrimSpace(d)
 }
 
+// writeCSV derives data.csv from the same records that go into data.json so the
+// two files never drift apart. Written on every run, including runs that add no
+// new notices, so a missing/stale CSV is repaired without waiting for new data.
+func writeCSV(fName string, notices []Notice) error {
+	file, err := os.Create(fName)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// UTF-8 BOM so Excel opens the Turkish characters correctly.
+	if _, err := file.WriteString("\ufeff"); err != nil {
+		return err
+	}
+
+	w := csv.NewWriter(file)
+	if err := w.Write([]string{"date", "title", "url", "image", "content"}); err != nil {
+		return err
+	}
+	for _, n := range notices {
+		if err := w.Write([]string{n.Date, n.Title, n.Url, n.Image, n.Content}); err != nil {
+			return err
+		}
+	}
+	w.Flush()
+	return w.Error()
+}
+
 func main() {
 	fName := "data.json"
+	csvName := "data.csv"
 	existingNotices := []Notice{}
 	absPath, _ := filepath.Abs(fName)
 	if _, err := os.Stat(absPath); err == nil {
@@ -230,8 +260,9 @@ func main() {
 
 	fmt.Printf("Scraped %d notices from %d page(s).\n", seenOnSite, maxPage)
 
+	finalNotices := existingNotices
 	if len(newNotices) > 0 {
-		finalNotices := append(newNotices, existingNotices...)
+		finalNotices = append(newNotices, existingNotices...)
 		// Safety net: never let a run shrink the dataset (e.g. due to a scraping
 		// regression), which is what caused the historical data loss incident.
 		if len(finalNotices) < len(existingNotices) {
@@ -240,15 +271,23 @@ func main() {
 		file, err := os.Create(fName)
 		if err != nil {
 			log.Fatalf("Cannot create file %q: %s\n", fName, err)
-			return
 		}
-		defer file.Close()
-
 		enc := json.NewEncoder(file)
 		enc.SetIndent("", "  ")
-		enc.Encode(finalNotices)
+		if err := enc.Encode(finalNotices); err != nil {
+			file.Close()
+			log.Fatalf("Cannot write file %q: %s\n", fName, err)
+		}
+		file.Close()
 		fmt.Printf("Crawler finished. New notices added: %d. Total records: %d\n", len(newNotices), len(finalNotices))
 	} else {
 		fmt.Println("No new notices found to add.")
 	}
+
+	// data.csv is a derived view of data.json, so regenerate it on every run - even
+	// when nothing new was added - so the two files never drift apart.
+	if err := writeCSV(csvName, finalNotices); err != nil {
+		log.Fatalf("Cannot write file %q: %s\n", csvName, err)
+	}
+	fmt.Printf("Wrote %s with %d records.\n", csvName, len(finalNotices))
 }
