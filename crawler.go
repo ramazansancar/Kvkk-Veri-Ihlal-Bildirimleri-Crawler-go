@@ -1,9 +1,14 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/csv"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
@@ -13,6 +18,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gocolly/colly/v2"
@@ -40,12 +46,114 @@ var processedInSession = make(map[string]bool)
 // Transport-level errors seen while fetching listing pages.
 var fetchErrs []error
 
+// kvkk.gov.tr serves only its leaf certificate and omits the GlobalSign
+// intermediate that signed it. Browsers hide this by downloading the missing
+// intermediate from the URL in the certificate's Authority Information Access
+// (AIA) extension; Go does not, so every request failed with
+// "x509: certificate signed by unknown authority". The transport below does the
+// same AIA fetch the browsers do.
+
+// kvkkTransport is shared by every collector so connections are reused.
+var kvkkTransport = newKvkkTransport()
+
+func newKvkkTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.TLSClientConfig = &tls.Config{
+		// Go's built-in verification only uses the chain the server sends, so it
+		// has to be turned off and replaced by VerifyConnection. This is not a
+		// verification bypass: verifyWithAIA runs the full check (system roots,
+		// expiry, hostname) and the handshake is aborted if it returns an error.
+		InsecureSkipVerify: true,
+		VerifyConnection:   verifyWithAIA,
+	}
+	return t
+}
+
+var (
+	aiaMu     sync.Mutex
+	aiaCache  = map[string]*x509.Certificate{}
+	aiaClient = &http.Client{Timeout: 15 * time.Second}
+)
+
+// verifyWithAIA verifies the server chain like Go's default verifier. If that
+// fails only because an intermediate is missing, it downloads the issuer from
+// the AIA URL and retries. Downloaded certificates are used as intermediates
+// only, never as trust anchors, so the chain must still end in a system root.
+func verifyWithAIA(cs tls.ConnectionState) error {
+	if len(cs.PeerCertificates) == 0 {
+		return errors.New("tls: server presented no certificates")
+	}
+	leaf := cs.PeerCertificates[0]
+	intermediates := x509.NewCertPool()
+	for _, cert := range cs.PeerCertificates[1:] {
+		intermediates.AddCert(cert)
+	}
+	opts := x509.VerifyOptions{DNSName: cs.ServerName, Intermediates: intermediates}
+
+	_, err := leaf.Verify(opts)
+	var unknownAuthority x509.UnknownAuthorityError
+	if err == nil || !errors.As(err, &unknownAuthority) {
+		return err
+	}
+
+	// Walk up the AIA links (bounded) until the chain reaches a trusted root.
+	cert := leaf
+	for depth := 0; depth < 3 && len(cert.IssuingCertificateURL) > 0; depth++ {
+		issuer, fetchErr := fetchIssuer(cert.IssuingCertificateURL[0])
+		if fetchErr != nil {
+			return fmt.Errorf("%w (AIA fetch failed: %v)", err, fetchErr)
+		}
+		intermediates.AddCert(issuer)
+		if _, err = leaf.Verify(opts); err == nil {
+			return nil
+		}
+		cert = issuer
+	}
+	return err
+}
+
+// fetchIssuer downloads (and caches for the run) the certificate at an AIA
+// "CA Issuers" URL. These are usually plain DER, occasionally PEM.
+func fetchIssuer(u string) (*x509.Certificate, error) {
+	aiaMu.Lock()
+	defer aiaMu.Unlock()
+	if cert, ok := aiaCache[u]; ok {
+		return cert, nil
+	}
+
+	resp, err := aiaClient.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: status %d", u, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+
+	cert, err := x509.ParseCertificate(body)
+	if err != nil {
+		if block, _ := pem.Decode(body); block != nil {
+			cert, err = x509.ParseCertificate(block.Bytes)
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("parse certificate from %s: %v", u, err)
+	}
+	aiaCache[u] = cert
+	return cert, nil
+}
+
 func getArticleContent(noticeUrl string) string {
 	var content strings.Builder
 	c := colly.NewCollector(
 		colly.AllowedDomains("kvkk.gov.tr", "www.kvkk.gov.tr"),
 	)
 	c.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	c.WithTransport(kvkkTransport)
 
 	c.OnResponse(func(r *colly.Response) {
 		if strings.Contains(string(r.Body), "resend()") {
@@ -198,6 +306,7 @@ func main() {
 			colly.AllowedDomains("kvkk.gov.tr", "www.kvkk.gov.tr"),
 		)
 		lc.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+		lc.WithTransport(kvkkTransport)
 		lc.SetRequestTimeout(30 * time.Second)
 
 		// Without an OnError handler colly swallows transport errors, so a site outage
