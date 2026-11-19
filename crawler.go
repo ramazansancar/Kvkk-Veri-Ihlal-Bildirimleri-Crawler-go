@@ -203,6 +203,31 @@ func normalizeDate(raw string) string {
 	return strings.TrimSpace(d)
 }
 
+// writeJSON writes data.json. Write to a temp file and rename so a failed or
+// interrupted write can never leave a truncated data.json behind.
+func writeJSON(fName string, notices []Notice) error {
+	tmp := fName + ".tmp"
+	file, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(file)
+	enc.SetIndent("", "  ")
+	// Keep "&", "<", ">" as-is instead of "\u0026" etc.: data.json is read by
+	// people and tools, never embedded in HTML, so the escaping only hurts.
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(notices); err != nil {
+		file.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, fName)
+}
+
 // writeCSV derives data.csv from the same records that go into data.json so the
 // two files never drift apart. Written on every run, including runs that add no
 // new notices, so a missing/stale CSV is repaired without waiting for new data.
@@ -432,26 +457,24 @@ func main() {
 	finalNotices := existingNotices
 	if len(newNotices) > 0 {
 		finalNotices = append(newNotices, existingNotices...)
-		// Safety net: never let a run shrink the dataset (e.g. due to a scraping
-		// regression), which is what caused the historical data loss incident.
-		if len(finalNotices) < len(existingNotices) {
-			log.Fatalf("Refusing to write: final record count (%d) is lower than existing (%d)\n", len(finalNotices), len(existingNotices))
-		}
-		file, err := os.Create(fName)
-		if err != nil {
-			log.Fatalf("Cannot create file %q: %s\n", fName, err)
-		}
-		enc := json.NewEncoder(file)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(finalNotices); err != nil {
-			file.Close()
-			log.Fatalf("Cannot write file %q: %s\n", fName, err)
-		}
-		file.Close()
-		fmt.Printf("Crawler finished. New notices added: %d. Total records: %d\n", len(newNotices), len(finalNotices))
+		fmt.Printf("New notices added: %d. Total records: %d\n", len(newNotices), len(finalNotices))
 	} else {
 		fmt.Println("No new notices found to add.")
 	}
+	// Safety net: never let a run shrink the dataset (e.g. due to a scraping
+	// regression), which is what caused the historical data loss incident.
+	if len(finalNotices) < len(existingNotices) {
+		log.Fatalf("Refusing to write: final record count (%d) is lower than existing (%d)\n", len(finalNotices), len(existingNotices))
+	}
+
+	// Rewrite data.json on every run, not only when something new was found, so a
+	// format change (like the escaping fix in writeJSON) also normalizes existing records.
+	// The output is deterministic, so an unchanged dataset produces an identical
+	// file and the workflow has nothing to commit.
+	if err := writeJSON(fName, finalNotices); err != nil {
+		log.Fatalf("Cannot write file %q: %s\n", fName, err)
+	}
+	fmt.Printf("Wrote %s with %d records.\n", fName, len(finalNotices))
 
 	// data.csv is a derived view of data.json, so regenerate it on every run - even
 	// when nothing new was added - so the two files never drift apart.
